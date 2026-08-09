@@ -3,16 +3,16 @@ name: OIDC Test
 on:
   workflow_dispatch:
   push:
-    branches: [ main ]
+    branches: [ master ]
 
 permissions:
   id-token: write
   contents: read
 
-# env:
-#   AWS_REGION: ap-south-1        # cluster ap-south-1 la irukku, us-west-2 illa
-#   CLUSTER: ai-interview
-#   NS: demo
+env:
+  AWS_REGION: ap-south-1        # cluster ap-south-1 la irukku, us-west-2 illa
+  CLUSTER: ai-interview
+  NS: demo
 
 jobs:
   verify:
@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::043083733056:role/My-Demo-Role
+          role-to-assume: arn:aws:iam::043083733056:role/My-Role
           role-session-name: gh-oidc-test
           aws-region: ${{ env.AWS_REGION }}
 
