@@ -1,0 +1,73 @@
+# Tests the frontend. Does not deploy, does not touch AWS.
+name: CI frontend
+
+# No path filters: this repo is the frontend, so every change is relevant.
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch cancels this run
+concurrency:
+  group: ci-frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  app:
+    name: React app
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      # npm ci, not npm install: fails if package.json and the lockfile disagree
+      - name: Install
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      # The test script is already `vitest run`, so no watch mode to disable
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+  secrets:
+    name: GitLeaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: read
+      # gitleaks-action comments its findings on the pull request
+      pull-requests: write
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history: a secret committed and later removed is still in the
+          # history and still compromised, so a shallow clone would miss it.
+          fetch-depth: 0
+
+      # Here rather than in security.yml, because a leaked secret must stop the
+      # deploy. security.yml runs on pull requests and nightly, neither of which
+      # gates a push straight to main.
+      #
+      # No GITLEAKS_CONFIG: there is no .gitleaks.toml in this repo, so the
+      # built-in ruleset applies. Point it at a file only once one exists.
+      - name: Scan for secrets
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
