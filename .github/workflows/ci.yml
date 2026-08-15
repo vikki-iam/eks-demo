@@ -1,5 +1,16 @@
-# Tests the frontend. Does not deploy, does not touch AWS.
-name: CI frontend
+# Test the frontend, then build/scan/push the image and deploy it to EKS.
+#
+# CI and CD are one workflow on purpose. The deploy used to live in cd.yml
+# behind a `workflow_run` trigger, which never fired: workflow_run only runs
+# the copy of the file on the repository's DEFAULT branch, and the default
+# here is main while the work is on master. A `needs:` gate has no such rule -
+# it runs from the branch's own copy, so this cannot silently stop working.
+#
+# No Helm yet - the manifests in k8s/ are applied directly and the image tag is
+# substituted with sed. That is deliberate: everything Helm would do for you
+# (atomic rollback, restart-on-config-change, refusing to render without a tag)
+# has to be done by hand here, and doing it by hand is the point.
+name: CI/CD frontend
 
 # No path filters: this repo is the frontend, so every change is relevant.
 on:
@@ -8,10 +19,12 @@ on:
   pull_request:
   workflow_dispatch:
 
-# A newer push to the same branch cancels this run
+# A newer push supersedes an older run - but only for pull requests. A push run
+# can reach the deploy job, and cancelling that mid-rollout leaves the cluster
+# half-updated with nothing left running to roll it back.
 concurrency:
   group: ci-frontend-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -61,9 +74,8 @@ jobs:
           # history and still compromised, so a shallow clone would miss it.
           fetch-depth: 0
 
-      # Here rather than in security.yml, because a leaked secret must stop the
-      # deploy. security.yml runs on pull requests and nightly, neither of which
-      # gates a push straight to main.
+      # A leaked secret must stop the deploy, so this gates it via `needs`
+      # below rather than running as an advisory scan somewhere else.
       #
       # No GITLEAKS_CONFIG: there is no .gitleaks.toml in this repo, so the
       # built-in ruleset applies. Point it at a file only once one exists.
@@ -71,3 +83,173 @@ jobs:
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy:
+    name: Deploy to EKS
+    # The CI gate. Both must pass - this is what workflow_run's
+    # `conclusion == 'success'` check used to do, without the indirection.
+    needs: [app, secrets]
+
+    # master only. A pull_request run never reaches here, and a push to main
+    # builds and tests but does not deploy. workflow_dispatch stays allowed so
+    # a deploy can still be re-run by hand, which cd.yml supported.
+    if: >-
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+
+    runs-on: ubuntu-latest
+    # `rollout status` caps itself at 5m, but nothing else here does. Without a
+    # job timeout a hung kubectl holds the concurrency slot for six hours.
+    timeout-minutes: 20
+
+    # One deploy at a time, across runs. Separate from the workflow-level group
+    # above, and explicitly not cancellable, for the reason given up there.
+    concurrency:
+      group: deploy-frontend
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      # Required for OIDC - GitHub sends AWS a signed token instead of an
+      # access key.
+      id-token: write
+
+    env:
+      # The cluster is in ap-south-1. The AWS CLI's own default is not, so every
+      # command here passes the region explicitly.
+      AWS_REGION: ap-south-1
+      CLUSTER: ai-interview-dev
+
+      # The namespace the EKS access entry is scoped to. Deploying anywhere else
+      # fails with "You must be logged in to the server", even though the AWS
+      # login succeeded.
+      NS: demo
+
+      # ECR path. The "-platform" suffix is part of the repository name; dropping
+      # it produces ImagePullBackOff and nothing more descriptive.
+      ECR_REPO: ai-interview-dev-platform
+
+      # Plain github.sha, because this job is in the same run as the tests. Under
+      # workflow_run it had to be event.workflow_run.head_sha - there, github.sha
+      # is the branch tip rather than the commit CI tested, so the build and the
+      # tag could disagree. That whole hazard is gone with the trigger.
+      SHA: ${{ github.sha }}
+
+    steps:
+      # Default ref is the commit that triggered the run - the same one `app`
+      # and `secrets` just checked out and passed on.
+      - uses: actions/checkout@v4
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gh-deploy-frontend
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build context is the repository root - this repo IS the frontend.
+      - name: Build
+        run: docker build -t scan-target .
+
+      # Scan before the image leaves the runner, so a vulnerable image never
+      # reaches ECR. Only fixable CRITICALs fail: an unpatched CVE in a base
+      # image cannot be actioned here, and blocking on it teaches people to
+      # ignore the gate.
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: scan-target
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+
+      # Tagged with the commit sha, so every running pod is traceable to one
+      # commit. A moving tag like :latest makes "what is deployed?" unanswerable.
+      - name: Push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPO/frontend:$SHA"
+          docker tag scan-target "$IMAGE"
+          docker push "$IMAGE"
+
+      # Needs eks:DescribeCluster in IAM. That is a separate grant from the EKS
+      # access entry - this step passes with only the IAM permission, and every
+      # kubectl below then fails.
+      - name: Get cluster credentials
+        id: creds
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER"
+
+      - name: Deploy
+        id: deploy
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPO/frontend:$SHA"
+
+          kubectl apply -n "$NS" -f k8s/configmap.yaml -f k8s/service.yaml
+
+          # The image tag is the one value that changes per deploy, so it is a
+          # placeholder in the file and substituted here. Crude on purpose.
+          sed "s|IMAGE_PLACEHOLDER|$IMAGE|" k8s/deployment.yaml | kubectl apply -n "$NS" -f -
+
+          # kubectl apply returns as soon as the API server accepts the object.
+          # Without this the job goes green before a single pod is running.
+          kubectl rollout status deployment/frontend -n "$NS" --timeout=5m
+
+      # rollout status only catches "the pods never became ready". A pod can be
+      # ready and still serve nothing, so check something the probe does not:
+      # nginx serving the actual SPA shell, reached through the Service.
+      #
+      # The pod name carries the run attempt as well as the sha: a re-run of the
+      # same commit would otherwise collide with a pod that --rm failed to clean
+      # up, and fail on "already exists" rather than on the app.
+      #
+      # curl is pinned, not :latest. This pull happens inside the cluster from
+      # Docker Hub, so a moving tag makes the verification step - the one that
+      # decides whether to roll back - depend on an image that can change.
+      - name: Verify
+        run: |
+          kubectl run "verify-fe-${SHA:0:8}-${GITHUB_RUN_ATTEMPT}" \
+            --rm --attach --restart=Never -q \
+            -n "$NS" --image=curlimages/curl:8.11.1 -- \
+            -fsS --max-time 10 http://frontend/ -o /dev/null
+
+      # Runs whether the rollout or the verification failed - a failed `rollout
+      # status` leaves the broken ReplicaSet in place either way, unlike a Helm
+      # --atomic setup.
+      #
+      # But NOT on any earlier failure. A bare `if: failure()` also fires when
+      # the build or the Trivy scan failed, and would then undo whatever is
+      # currently running - a healthy deploy - over a CVE that never reached the
+      # cluster. The condition checks that the Deploy step actually started;
+      # steps skipped after an earlier failure match neither outcome.
+      #
+      # Note what this does NOT undo: the ConfigMap and Service were already
+      # applied and stay at the new version. With one config key that is
+      # harmless; it stops being harmless as soon as there are more.
+      - name: Roll back
+        if: failure() && (steps.deploy.outcome == 'success' || steps.deploy.outcome == 'failure')
+        run: |
+          echo "::error::Deploy or verification failed - rolling back"
+          kubectl rollout undo deployment/frontend -n "$NS" || true
+          # `undo` returns as soon as the API server accepts the change, exactly
+          # like `apply`. Without this the job ends without anyone knowing
+          # whether the rollback itself came up.
+          kubectl rollout status deployment/frontend -n "$NS" --timeout=3m || true
+          kubectl get pods -n "$NS" -l app=frontend
+          kubectl describe pods -n "$NS" -l app=frontend | tail -30
+
+      # Gated on the credentials step: with no kubeconfig every command below
+      # fails, turning an already-red job red for a second, misleading reason.
+      - name: Show what is running
+        if: always() && steps.creds.outcome == 'success'
+        run: |
+          kubectl get pods -n "$NS" -l app=frontend
+          kubectl get deploy frontend -n "$NS" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
