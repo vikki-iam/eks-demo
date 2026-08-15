@@ -20,7 +20,7 @@ jobs:
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::043083733056:role/My-Demo-Role
+          role-to-assume: arn:aws:iam::043083733056:role/My-Role
           role-session-name: gh-oidc-test
           aws-region: ${{ env.AWS_REGION }}
 
