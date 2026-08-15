@@ -118,11 +118,14 @@ jobs:
       # The cluster is in ap-south-1. The AWS CLI's own default is not, so every
       # command here passes the region explicitly.
       AWS_REGION: ap-south-1
-      CLUSTER: ai-interview-dev
+      # The one cluster that exists in this account/region. It is NOT
+      # "ai-interview-dev" - that name resolves to nothing and fails at
+      # update-kubeconfig with ResourceNotFoundException.
+      CLUSTER: ai-interview
 
-      # The namespace the EKS access entry is scoped to. Deploying anywhere else
-      # fails with "You must be logged in to the server", even though the AWS
-      # login succeeded.
+      # Namespace to deploy into. My-Role's EKS access entry is
+      # AmazonEKSClusterAdminPolicy scoped to the whole cluster, so this is a
+      # convention rather than a boundary the cluster enforces.
       NS: demo
 
       # ECR path. The "-platform" suffix is part of the repository name; dropping
