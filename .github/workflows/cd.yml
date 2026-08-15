@@ -1,0 +1,149 @@
+# Build the frontend image, scan it, push it to ECR, deploy it with kubectl.
+#
+# No Helm yet - the manifests in k8s/ are applied directly and the image tag is
+# substituted with sed. That is deliberate: everything Helm would do for you
+# (atomic rollback, restart-on-config-change, refusing to render without a tag)
+# has to be done by hand here, and doing it by hand is the point.
+name: Deploy frontend
+
+on:
+  # Only after CI passes. The string must match the `name:` field inside
+  # ci.yml exactly - not the filename. A mismatch means this never fires and
+  # there is no error anywhere to tell you.
+  workflow_run:
+    workflows: ["CI frontend"]
+    types: [completed]
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  # The cluster is in ap-south-1. The AWS CLI's own default is not, so every
+  # command here passes the region explicitly.
+  AWS_REGION: ap-south-1
+  CLUSTER: ai-interview-dev
+
+  # The namespace the EKS access entry is scoped to. Deploying anywhere else
+  # fails with "You must be logged in to the server", even though the AWS
+  # login succeeded.
+  NS: demo
+
+  # ECR path. The "-platform" suffix is part of the repository name; dropping
+  # it produces ImagePullBackOff and nothing more descriptive.
+  ECR_REPO: ai-interview-dev-platform
+
+  # The commit CI actually tested. On a workflow_run event github.sha is the
+  # tip of the branch, NOT the commit that triggered the run - using it would
+  # build one commit and tag it as another. Falls back to github.sha for a
+  # manual dispatch, where workflow_run is empty.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+permissions:
+  contents: read
+  # Required for OIDC - GitHub sends AWS a signed token instead of an access key.
+  id-token: write
+
+jobs:
+  deploy:
+    # workflow_run fires when CI finishes, pass OR fail. Without this a red CI
+    # would still deploy.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Same reason as SHA: the default checkout takes the branch tip, which
+          # may already be a newer commit than the one CI passed.
+          ref: ${{ env.SHA }}
+
+      - name: Log in to AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gh-deploy-frontend
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Build context is the repository root - this repo IS the frontend.
+      - name: Build
+        run: docker build -t scan-target .
+
+      # Scan before the image leaves the runner, so a vulnerable image never
+      # reaches ECR. Only fixable CRITICALs fail: an unpatched CVE in a base
+      # image cannot be actioned here, and blocking on it teaches people to
+      # ignore the gate.
+      - name: Scan the image
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: image
+          image-ref: scan-target
+          severity: CRITICAL
+          ignore-unfixed: true
+          format: table
+          exit-code: '1'
+
+      # Tagged with the commit sha, so every running pod is traceable to one
+      # commit. A moving tag like :latest makes "what is deployed?" unanswerable.
+      - name: Push
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPO/frontend:$SHA"
+          docker tag scan-target "$IMAGE"
+          docker push "$IMAGE"
+
+      # Needs eks:DescribeCluster in IAM. That is a separate grant from the EKS
+      # access entry - this step passes with only the IAM permission, and every
+      # kubectl below then fails.
+      - name: Get cluster credentials
+        run: aws eks update-kubeconfig --region "$AWS_REGION" --name "$CLUSTER"
+
+      - name: Deploy
+        id: deploy
+        env:
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
+        run: |
+          IMAGE="$REGISTRY/$ECR_REPO/frontend:$SHA"
+
+          kubectl apply -n "$NS" -f k8s/configmap.yaml -f k8s/service.yaml
+
+          # The image tag is the one value that changes per deploy, so it is a
+          # placeholder in the file and substituted here. Crude on purpose.
+          sed "s|IMAGE_PLACEHOLDER|$IMAGE|" k8s/deployment.yaml | kubectl apply -n "$NS" -f -
+
+          # kubectl apply returns as soon as the API server accepts the object.
+          # Without this the job goes green before a single pod is running.
+          kubectl rollout status deployment/frontend -n "$NS" --timeout=5m
+
+      # rollout status only catches "the pods never became ready". A pod can be
+      # ready and still serve nothing, so check something the probe does not:
+      # nginx serving the actual SPA shell, reached through the Service.
+      - name: Verify
+        run: |
+          kubectl run verify-fe-${SHA:0:8} --rm --attach --restart=Never -q \
+            -n "$NS" --image=curlimages/curl:latest -- \
+            -fsS --max-time 10 http://frontend/ -o /dev/null
+
+      # Not gated on the deploy step succeeding, unlike a Helm --atomic setup.
+      # A failed `rollout status` leaves the broken ReplicaSet in place, so this
+      # has to run whether the failure was the rollout or the verification.
+      #
+      # Note what this does NOT undo: the ConfigMap and Service were already
+      # applied and stay at the new version. With one config key that is
+      # harmless; it stops being harmless as soon as there are more.
+      - name: Roll back
+        if: failure()
+        run: |
+          echo "::error::Deploy or verification failed - rolling back"
+          kubectl rollout undo deployment/frontend -n "$NS" || true
+          kubectl get pods -n "$NS" -l app=frontend
+          kubectl describe pods -n "$NS" -l app=frontend | tail -30
+
+      - name: Show what is running
+        if: always()
+        run: |
+          kubectl get pods -n "$NS" -l app=frontend
+          kubectl get deploy frontend -n "$NS" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
