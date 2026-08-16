@@ -5,7 +5,7 @@
 # Stage 2 is nginx serving that bundle as an unprivileged user on port 3000.
 #
 # The final image contains no Node runtime, no node_modules and no source: only
-# static assets and nginxr.
+# static assets and nginx.
 # =============================================================================
 
 # ---------- Stage 1: build ----------
